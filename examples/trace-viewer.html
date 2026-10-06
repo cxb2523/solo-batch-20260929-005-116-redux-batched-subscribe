@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>batchedSubscribe trace viewer</title>
+  <style>
+    :root {
+      --bg: #0f1420;
+      --panel: #182031;
+      --ink: #e7ecf5;
+      --muted: #8b96ab;
+      --accent: #5b8cff;
+      --sync: #43c6ac;
+      --async: #f5a623;
+      --bar: #6f8dff;
+      --border: #28324a;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: var(--bg);
+      color: var(--ink);
+      padding: 24px;
+    }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    p.sub { color: var(--muted); margin: 0 0 20px; font-size: 13px; }
+    .controls { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+    button {
+      appearance: none;
+      border: 1px solid var(--border);
+      background: var(--panel);
+      color: var(--ink);
+      padding: 9px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: border-color .15s, transform .05s;
+    }
+    button:hover { border-color: var(--accent); }
+    button:active { transform: translateY(1px); }
+    button.primary { background: var(--accent); border-color: var(--accent); color: #0b1020; font-weight: 600; }
+    button.sync { border-color: var(--sync); }
+    button.async { border-color: var(--async); }
+    #status { font-size: 12px; color: var(--muted); margin-bottom: 14px; }
+    .round {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 12px 14px;
+      margin-bottom: 12px;
+    }
+    .round h3 { margin: 0 0 10px; font-size: 13px; font-weight: 600; display: flex; gap: 10px; align-items: center; }
+    .tag { font-size: 10px; padding: 2px 7px; border-radius: 999px; text-transform: uppercase; letter-spacing: .5px; }
+    .tag.sync { background: rgba(67,198,172,.15); color: var(--sync); border: 1px solid var(--sync); }
+    .tag.async { background: rgba(245,166,35,.15); color: var(--async); border: 1px solid var(--async); }
+    .lane { display: grid; grid-template-columns: 120px 1fr 70px; gap: 10px; align-items: center; margin-bottom: 6px; }
+    .lane .name { font-size: 12px; color: var(--muted); font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .lane .track { background: #0d1322; border-radius: 6px; height: 18px; position: relative; overflow: hidden; }
+    .lane .bar { position: absolute; top: 0; bottom: 0; left: 0; background: var(--bar); border-radius: 6px; min-width: 3px; }
+    .lane .dur { font-size: 11px; color: var(--muted); text-align: right; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .empty { color: var(--muted); font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 12px; }
+    th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border); font-family: ui-monospace, Menlo, Consolas, monospace; }
+    th { color: var(--muted); font-weight: 500; }
+  </style>
+</head>
+<body>
+  <h1>batchedSubscribe trace viewer</h1>
+  <p class="sub">Dispatches are traced per notification round: call ordinal, cumulative calls and duration. The async scheduler coalesces dispatches issued in the same tick into one round.</p>
+
+  <div class="controls">
+    <button class="primary" id="btn-sync">Dispatch (sync, immediate)</button>
+    <button class="async" id="btn-async-single">Dispatch (async)</button>
+    <button class="async" id="btn-async-burst">Dispatch x3 (async, one tick)</button>
+    <button id="btn-clear">Clear</button>
+  </div>
+  <div id="status">notifying: false · rounds: 0</div>
+  <div id="timeline"><div class="empty">No rounds yet — press a dispatch button.</div></div>
+
+  <script>
+    'use strict';
+
+    // --- Self-contained ES5 port of batchedSubscribe + tracing wrapper ---
+    function batchedSubscribe(batch) {
+      var currentListeners = [];
+      var nextListeners = currentListeners;
+
+      function ensureCanMutateNextListeners() {
+        if (nextListeners === currentListeners) {
+          nextListeners = currentListeners.slice();
+        }
+      }
+
+      function subscribe(listener) {
+        var isSubscribed = true;
+        ensureCanMutateNextListeners();
+        nextListeners.push(listener);
+        return function unsubscribe() {
+          if (!isSubscribed) return;
+          isSubscribed = false;
+          ensureCanMutateNextListeners();
+          var index = nextListeners.indexOf(listener);
+          nextListeners.splice(index, 1);
+        };
+      }
+
+      function notifyListeners() {
+        var listeners = currentListeners = nextListeners;
+        for (var i = 0; i < listeners.length; i++) listeners[i]();
+      }
+
+      return function () {
+        return {
+          dispatch: function () { batch(notifyListeners); },
+          subscribe: subscribe
+        };
+      };
+    }
+
+    var globalRoundSeq = 0;
+
+    function createTracedStore(options) {
+      options = options || {};
+      var scheduler = options.scheduler || function (notify) { notify(); };
+      var pathLabel = options.label || 'sync';
+      var now = options.now || function () {
+        return (window.performance && performance.now()) ? performance.now() : Date.now();
+      };
+
+      var rounds = [];
+      var callCounts = {};
+      var roundStack = [];
+      var registrationSeq = 0;
+      var enhancer = batchedSubscribe(function (notify) {
+        return scheduler(function tracedNotify() {
+          globalRoundSeq += 1;
+          var round = {
+            id: globalRoundSeq, label: pathLabel, startedAt: now(),
+            endedAt: null, duration: null, listeners: []
+          };
+          rounds.push(round);
+          roundStack.push(round);
+          try { notify(); } finally {
+            round.endedAt = now();
+            round.duration = round.endedAt - round.startedAt;
+            roundStack.pop();
+          }
+        });
+      });
+
+      var inner = enhancer()();
+
+      function traceListener(listener, id, name) {
+        return function () {
+          var round = roundStack[roundStack.length - 1];
+          var ordinal = round.listeners.length + 1;
+          var callCount = (callCounts[id] || 0) + 1;
+          callCounts[id] = callCount;
+          var startedAt = now();
+          try { listener(); } finally {
+            round.listeners.push({
+              round: round.id, ordinal: ordinal, id: id, name: name,
+              callCount: callCount, duration: now() - startedAt
+            });
+          }
+        };
+      }
+
+      return {
+        dispatch: function (action) { inner.dispatch(action); },
+        subscribe: function (listener, name) {
+          registrationSeq += 1;
+          var id = registrationSeq;
+          return inner.subscribe(traceListener(listener, id, name || ('listener_' + id)));
+        },
+        getTrace: function () {
+          return {
+            notifying: roundStack.length > 0,
+            rounds: rounds.map(function (r) {
+              return { id: r.id, label: r.label, duration: r.duration, listeners: r.listeners.slice() };
+            })
+          };
+        },
+        isNotifying: function () { return roundStack.length > 0; }
+      };
+    }
+
+    function coalescingScheduler() {
+      var pending = null;
+      var scheduled = false;
+      return function (notify) {
+        pending = notify;
+        if (!scheduled) {
+          scheduled = true;
+          setTimeout(function () {
+            scheduled = false;
+            var run = pending;
+            pending = null;
+            if (run) run();
+          }, 0);
+        }
+      };
+    }
+
+    function work(ms) {
+      var start = performance.now();
+      while (performance.now() - start < ms) { /* busy wait for a measurable bar */ }
+    }
+
+    function makeListeners(target) {
+      target.subscribe(function () { work(6); }, 'render-list');
+      target.subscribe(function () { work(3); }, 'update-badge');
+      target.subscribe(function () { work(10); }, 'persist');
+    }
+
+    var syncStore = createTracedStore({ label: 'sync' });
+    var asyncStore = createTracedStore({ label: 'async', scheduler: coalescingScheduler() });
+    makeListeners(syncStore);
+    makeListeners(asyncStore);
+
+    var timeline = document.getElementById('timeline');
+    var status = document.getElementById('status');
+
+    function render() {
+      var syncTrace = syncStore.getTrace();
+      var asyncTrace = asyncStore.getTrace();
+      var rounds = syncTrace.rounds.concat(asyncTrace.rounds)
+        .sort(function (a, b) { return a.id - b.id; });
+      var notifying = syncTrace.notifying || asyncTrace.notifying;
+      status.textContent = 'notifying: ' + notifying + ' · rounds: ' + rounds.length;
+      if (!rounds.length) {
+        timeline.innerHTML = '<div class="empty">No rounds yet — press a dispatch button.</div>';
+        return;
+      }
+      var html = '';
+      rounds.forEach(function (round) {
+        html += '<div class="round"><h3><span class="tag ' + round.label + '">' + round.label +
+          '</span> Round ' + round.id + ' · ' + round.listeners.length + ' listeners · ' +
+          round.duration.toFixed(2) + 'ms</h3>';
+        var max = Math.max.apply(null, round.listeners.map(function (l) { return l.duration; }).concat([1]));
+        round.listeners.forEach(function (entry) {
+          var pct = Math.max(4, Math.round((entry.duration / max) * 100));
+          html += '<div class="lane">' +
+            '<div class="name">#' + entry.ordinal + ' ' + entry.name +
+            ' <span style="opacity:.6">(x' + entry.callCount + ')</span></div>' +
+            '<div class="track"><div class="bar" style="width:' + pct + '%"></div></div>' +
+            '<div class="dur">' + entry.duration.toFixed(2) + 'ms</div>' +
+          '</div>';
+        });
+        html += '</div>';
+      });
+      timeline.innerHTML = html;
+    }
+
+    document.getElementById('btn-sync').addEventListener('click', function () {
+      syncStore.dispatch({ type: 'sync-tick' });
+      render();
+    });
+    document.getElementById('btn-async-single').addEventListener('click', function () {
+      asyncStore.dispatch({ type: 'async-single' });
+      setTimeout(render, 0);
+    });
+    document.getElementById('btn-async-burst').addEventListener('click', function () {
+      asyncStore.dispatch({ type: 'burst-1' });
+      asyncStore.dispatch({ type: 'burst-2' });
+      asyncStore.dispatch({ type: 'burst-3' });
+      setTimeout(render, 0);
+    });
+    document.getElementById('btn-clear').addEventListener('click', function () {
+      location.reload();
+    });
+
+    render();  </script>
+</body>
+</html>
+

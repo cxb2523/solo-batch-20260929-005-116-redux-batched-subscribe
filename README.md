@@ -65,3 +65,54 @@ const store = createStore(reducer, intialState, batchedSubscribe(unstable_batche
 ## Thanks
 
 Thanks to [Andrew Clark](https://github.com/acdlite) for the clean library structure.
+
+## Tracing wrapper
+
+`src/batchedSubscribe.trace.js` exposes a reusable tracing layer built on top of
+the unmodified `batchedSubscribe` enhancer:
+
+```js
+import { traceStore, createTracedStore } from './src/batchedSubscribe.trace';
+
+// traceStore is a ready-to-use createStore(reducer, preloadedState) function.
+const store = traceStore(rootReducer, initialState);
+
+store.subscribe(() => render(), 'render');
+store.dispatch({ type: 'tick' });
+
+store.getTrace();
+// { notifying: false, rounds: [{ id, duration, listeners: [
+//   { round, ordinal, id, name, callCount, duration } ] }] }
+```
+
+Inject a scheduler to decide where batching lands. An immediate scheduler counts
+each dispatch as one round; a coalescing/async scheduler merges every dispatch
+issued in the same tick into a single round:
+
+```js
+const store = createTracedStore({
+  scheduler: notify => setImmediate(notify), // injected (fake) scheduler
+  now: () => clock.now()                      // injectable clock for tests
+})(rootReducer, initialState);
+```
+
+The three moving parts are tied together at a single point: the
+`currentListeners`/`nextListeners` snapshot is swapped inside the original
+`notify()`, the re-entrant `notifying` round stack is set/reset around it, and
+the injected scheduler decides when the wrapped notification (and therefore a
+new round) actually runs. Listeners added or removed mid-notification follow the
+snapshot semantics — removals still run once in the current round, additions are
+absent until the next one.
+
+Open `examples/trace-viewer.html` in a browser for an interactive timeline of
+sync rounds and coalesced async rounds.
+
+The machine-checked behaviour lives in `docs/batching-contract.md`; verify it
+with:
+
+```
+npm run trace:check   # node scripts/trace-batching.js
+```
+
+The script prints the per-listener call sequence and exits non-zero if it does
+not match the contract tables line by line.

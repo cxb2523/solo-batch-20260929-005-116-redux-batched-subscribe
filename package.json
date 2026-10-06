@@ -12,6 +12,7 @@
     "build": "babel src --out-dir lib",
     "lint": "eslint src",
     "test": "mocha --compilers js:babel/register --recursive src/**/*-test.js",
+    "trace:check": "node scripts/trace-batching.js",
     "prepublish": "npm run clean && npm run lint && npm run test && npm run build"
   },
   "keywords": [
@@ -42,3 +43,4 @@
     "rimraf": "^2.5.0"
   }
 }
+
